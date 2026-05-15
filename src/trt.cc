@@ -1,133 +1,75 @@
 #include <ranges>
 #include "trt.hpp"
 
-std::unique_ptr<Logger> new_logger(Severity log_level)
-{
-    return std::make_unique<Logger>(log_level);
-}
-
-std::unique_ptr<nvinfer1::IRuntime> create_infer_runtime(std::unique_ptr<Logger> logger)
-{
-    auto runtime = nvinfer1::createInferRuntime(*logger);
-    return std::unique_ptr<nvinfer1::IRuntime>(runtime);
-}
-
-std::unique_ptr<nvinfer1::ICudaEngine> runtime_deserialize_cuda_engine(std::unique_ptr<nvinfer1::IRuntime> runtime, std::vector<rust::u8> model)
-{
-    auto engine = runtime->deserializeCudaEngine(model.data(), model.size());
-    return std::unique_ptr<nvinfer1::ICudaEngine>(engine);
-}
-
 std::unique_ptr<nvinfer1::Dims> new_dims(rust::Slice<const int32_t> dims_spec)
 {
     nvinfer1::Dims dims{};
 
-    dims.nbDims = std::min(dims_spec.length(), dims.MAX_DIMS);
-    std::ranges::copy(
-        dims_spec | std::views::take(dims.MAX_DIMS),
-        dims.d);
+    if (dims_spec.length() > dims.MAX_DIMS)
+        throw std::runtime_error("dimension count exceeds MAX_DIMS");
 
-    return std::unique_ptr<nvinfer1>(dims);
+    dims.nbDims = static_cast<int32_t>(dims_spec.length());
+    std::ranges::copy(dims_spec, dims.d);
+
+    auto dims_ptr = std::make_unique<nvinfer1::Dims>(dims);
+    if (!dims_ptr)
+        throw std::runtime_error("could not create dims");
+    return dims_ptr;
 }
 
-std::unique_ptr<nvinfer1::IExecutionContext> engine_create_execution_context(const nvinfer1::icudaengine &engine)
+void reshape_dims(const std::unique_ptr<nvinfer1::Dims> dims, rust::Slice<const int32_t> dims_spec)
 {
-    auto context = engine->createExecutionContext();
-    return std::unique_ptr<nvinfer1::IExecutionContext>(context);
+    if (dims_spec.length() > dims->MAX_DIMS)
+        throw std::runtime_error("dimension count exceeds MAX_DIMS");
+
+    dims->nbDims = static_cast<int32_t>(dims_spec.length());
+    std::ranges::copy(dims_spec, dims->d);
 }
 
-std::unique_ptr<nvinfer1::Dims> engine_get_tensor_shape(const nvinfer1::icudaengine &engine, rust::Str tensor_name)
+std::unique_ptr<Logger> new_logger(Severity log_level)
 {
-    return engine->getTensorShape(tensor_name.data());
+    auto logger = std::make_unique<Logger>(log_level);
+    if (!logger)
+        throw std::runtime_error("could not create logger");
+    return logger;
 }
 
-DataType engine_get_tensor_data_type(const nvinfer1::icudaengine &engine, rust::Str tensor_name)
+std::unique_ptr<nvinfer1::IRuntime> create_infer_runtime(const std::unique_ptr<Logger> &logger)
 {
-    return engine->getTensorDataType(tensor_name.data());
+    auto runtime = nvinfer1::createInferRuntime(*logger);
+    if (!runtime)
+        throw std::runtime_error("could not create runtime");
+    return std::unique_ptr<nvinfer1::IRuntime>(runtime);
 }
 
-TensorLocation engine_get_tensor_location(const nvinfer1::icudaengine &engine, rust::Str tensor_name)
+std::unique_ptr<nvinfer1::ICudaEngine> runtime_deserialize_cuda_engine(const std::unique_ptr<nvinfer1::IRuntime> &runtime, rust::Slice<const rust::u8> serialized_engine)
+
 {
-    return engine->getTensorLocation(tensor_name.data());
+    auto engine = runtime->deserializeCudaEngine(serialized_engine.data(), serialized_engine.length());
+    if (!engine)
+        throw std::runtime_error("could not create engine");
+    return std::unique_ptr<nvinfer1::ICudaEngine>(engine);
 }
 
-TensorIoMode engine_get_tensor_io_mode(const nvinfer1::icudaengine &engine, rust::Str tensor_name)
+std::unique_ptr<nvinfer1::Dims> engine_get_tensor_shape(const std::unique_ptr<nvinfer1::ICudaEngine> &engine, const char *tensor_name)
 {
-    return engine->getTensorIOMode(tensor_name.data());
-}
-
-int32_t engine_get_tensor_bytes_per_component1(const nvinfer1::icudaengine &engine, rust::Str tensor_name)
-{
-    return engine->getTensorBytesPerComponent(tensor_name.data());
-}
-
-int32_t engine_get_tensor_bytes_per_component2(const nvinfer1::icudaengine &engine, rust::Str tensor_name, int32_t profile_index)
-{
-    return engine->getTensorBytesPerComponent(tensor_name.data(), profile_index);
-}
-
-int32_t engine_get_tensor_components_per_element1(const nvinfer1::icudaengine &engine, rust::Str tensor_name)
-{
-    return engine->getTensorComponentsPerElement(tensor_name.data());
-}
-
-int32_t engine_get_tensor_components_per_element2(const nvinfer1::icudaengine &engine, rust::Str tensor_name, int32_t profile_index)
-{
-    return engine->getTensorComponentsPerElement(tensor_name.data(), profile_index);
-}
-
-TensorFormat engine_get_tensor_format1(const nvinfer1::icudaengine &engine, rust::Str tensor_name)
-{
-    return engine->getTensorFormat(tensor_name.data());
-}
-
-TensorFormat engine_get_tensor_format2(const nvinfer1::icudaengine &engine, rust::Str tensor_name, int32_t profile_index)
-{
-    return engine->getTensorFormat(tensor_name.data(), profile_index);
-}
-
-int32_t engine_get_tensor_vectorized_dim1(const nvinfer1::icudaengine &engine, rust::Str tensor_name)
-{
-    return engine->getTensorVectorizedDim2(tensor_name.data());
-}
-
-int32_t engine_get_tensor_vectorized_dim(const nvinfer1::icudaengine &engine, rust::Str tensor_name, int32_t profile_index)
-{
-    return engine->getTensorVectorizedDim(tensor_name.data(), profile_index);
-}
-
-int32_t engine_get_nb_optimization_profiles(const nvinfer1::icudaengine &engine)
-{
-    return engine->getNbOptimizationProfiles();
-}
-
-std::unique_ptr<nvinfer1::Dims> engine_get_profile_shape(const nvinfer1::icudaengine &engine, rust::Str tensor_name, int32_t profile_index, OptProfileSelector optimization_selector)
-{
-    auto dims = engine->getProfileShape(tensor_name.data(), profile_index, optimization_selector);
+    auto dims = engine->getTensorShape(tensor_name);
     return std::make_unique<nvinfer1::Dims>(dims);
 }
 
-int32_t engine_get_nb_io_tensors(const nvinfer1::icudaengine &engine)
+std::unique_ptr<nvinfer1::Dims> engine_get_profile_shape(const std::unique_ptr<nvinfer1::ICudaEngine> &engine, const char *tensor_name, int32_t profile_index, nvinfer1::OptProfileSelector optimization_selector)
 {
-    return engine->getNbIOTensors();
+    auto dims = engine->getProfileShape(tensor_name, profile_index, optimization_selector);
+    return std::make_unique<nvinfer1::Dims>(dims);
 }
 
-rust::Str engine_get_io_tensor_name(const nvinfer1::icudaengine &engine, int32_t index)
+bool context_set_tensor_address(const std::unique_ptr<nvinfer1::IExecutionContext> &context, const char *tensor_name, rust::usize addr)
 {
-    return engine->getIOTensorName(index);
+    auto ptr = reinterpret_cast<void *>(addr);
+    return context->setTensorAddress(tensor_name, ptr);
 }
 
-bool context_set_tensor_address(std::unique_ptr<nvinfer1::IExecutionContext> context, rust::Str tensor_name, void *cuda_ptr)
+bool context_set_input_shape(const std::unique_ptr<nvinfer1::IExecutionContext> &context, const char *tensor_name, const std::unique_ptr<nvinfer1::Dims> dims)
 {
-    return context->setTensorAddress(tensor_name.data(), cuda_ptr);
-}
-
-bool context_set_input_shape(std::unique_ptr<nvinfer1::IExecutionContext> context, rust::Str tensor_name, const std::unique_ptr<nvinfer1::Dims> dims)
-{
-    return context->setInputShape(tensor_name.data(), dims);
-}
-
-bool context_enqueue_v3(std::unique_ptr<nvinfer1::IExecutionContext> context, cudaStream_t stream)
-{
-    return context->enqueueV3(stream);
+    return context->setInputShape(tensor_name, *dims);
 }

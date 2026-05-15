@@ -1,6 +1,3 @@
-use std::env;
-use std::path::PathBuf;
-
 fn linux_multiarch_gnu() -> Option<&'static str> {
     let os = std::env::var("CARGO_CFG_TARGET_OS").ok()?;
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").ok()?;
