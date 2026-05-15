@@ -1,37 +1,59 @@
+#include <algorithm>
 #include <ranges>
+#include <span>
 #include "trt.hpp"
 
-std::unique_ptr<nvinfer1::Dims> new_dims(rust::Slice<const int32_t> dims_spec)
+std::unique_ptr<nvinfer1::Dims> dims_new(rust::Slice<const int64_t> spec)
 {
     nvinfer1::Dims dims{};
 
-    if (dims_spec.length() > dims.MAX_DIMS)
-        throw std::runtime_error("dimension count exceeds MAX_DIMS");
+    dims.nbDims = std::min(static_cast<int32_t>(spec.length()), dims.MAX_DIMS);
+    std::ranges::copy(spec | std::views::take(dims.MAX_DIMS), dims.d);
 
-    dims.nbDims = static_cast<int32_t>(dims_spec.length());
-    std::ranges::copy(dims_spec, dims.d);
-
-    auto dims_ptr = std::make_unique<nvinfer1::Dims>(dims);
-    if (!dims_ptr)
-        throw std::runtime_error("could not create dims");
-    return dims_ptr;
+    // can throw
+    return std::make_unique<nvinfer1::Dims>(dims);
 }
 
-void reshape_dims(const std::unique_ptr<nvinfer1::Dims> dims, rust::Slice<const int32_t> dims_spec)
+std::unique_ptr<nvinfer1::Dims> dims_invalid()
 {
-    if (dims_spec.length() > dims->MAX_DIMS)
-        throw std::runtime_error("dimension count exceeds MAX_DIMS");
-
-    dims->nbDims = static_cast<int32_t>(dims_spec.length());
-    std::ranges::copy(dims_spec, dims->d);
+    nvinfer1::Dims dims{};
+    dims.nbDims = -1;
+    return std::make_unique<nvinfer1::Dims>(dims); // can throw
 }
 
-std::unique_ptr<Logger> new_logger(Severity log_level)
+std::unique_ptr<nvinfer1::Dims> dims_clone(const std::unique_ptr<nvinfer1::Dims> &dims)
 {
-    auto logger = std::make_unique<Logger>(log_level);
-    if (!logger)
-        throw std::runtime_error("could not create logger");
-    return logger;
+    return std::make_unique<nvinfer1::Dims>(*dims); // can throw
+}
+
+int32_t dims_nb_dims(const std::unique_ptr<nvinfer1::Dims> &dims)
+{
+    return dims->nbDims;
+}
+
+int64_t dims_get_axis(const std::unique_ptr<nvinfer1::Dims> &dims, size_t idx)
+{
+    return std::span(dims->d, dims->nbDims).at(idx); // can throw
+}
+
+void dims_set_axis(const std::unique_ptr<nvinfer1::Dims> &dims, size_t idx, int64_t val)
+{
+    std::span(dims->d, dims->nbDims).at(idx) = val; // can throw
+}
+
+bool dims_is_invalid(const std::unique_ptr<nvinfer1::Dims> &dims)
+{
+    return dims->nbDims == -1 && dims->d[0] == 0;
+}
+
+bool dims_is_unknown_rank(const std::unique_ptr<nvinfer1::Dims> &dims)
+{
+    return dims->nbDims == -1 && dims->d[0] == -1;
+}
+
+std::unique_ptr<Logger> logger_new(Severity log_level)
+{
+    return std::make_unique<Logger>(log_level); // can throw
 }
 
 std::unique_ptr<nvinfer1::IRuntime> create_infer_runtime(const std::unique_ptr<Logger> &logger)
@@ -43,12 +65,19 @@ std::unique_ptr<nvinfer1::IRuntime> create_infer_runtime(const std::unique_ptr<L
 }
 
 std::unique_ptr<nvinfer1::ICudaEngine> runtime_deserialize_cuda_engine(const std::unique_ptr<nvinfer1::IRuntime> &runtime, rust::Slice<const rust::u8> serialized_engine)
-
 {
     auto engine = runtime->deserializeCudaEngine(serialized_engine.data(), serialized_engine.length());
     if (!engine)
         throw std::runtime_error("could not create engine");
     return std::unique_ptr<nvinfer1::ICudaEngine>(engine);
+}
+
+std::unique_ptr<nvinfer1::IExecutionContext> engine_create_execution_context(const std::unique_ptr<nvinfer1::ICudaEngine> &engine)
+{
+    auto context = engine->createExecutionContext();
+    if (!context)
+        throw std::runtime_error("could not create execution context");
+    return std::unique_ptr<nvinfer1::IExecutionContext>(context);
 }
 
 std::unique_ptr<nvinfer1::Dims> engine_get_tensor_shape(const std::unique_ptr<nvinfer1::ICudaEngine> &engine, const char *tensor_name)

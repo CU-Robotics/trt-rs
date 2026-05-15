@@ -1,6 +1,20 @@
 use cxx::UniquePtr;
-use std::ffi::{CStr, c_void};
+use std::{
+    collections::HashMap,
+    ffi::{CStr, CString, c_void},
+    sync::Arc,
+};
 use thiserror::Error;
+
+const UNNAMED_TENSOR: &str = "[unnamed tensor]";
+
+#[derive(Debug, Error)]
+pub enum ShapeError {
+    #[error("axis '{axis}' does not exist for rank-{rank} tensor")]
+    NoSuchAxis { axis: &'static str, rank: usize },
+    #[error("axis '{axis}' is not dynamic (value={value}), cannot override")]
+    NotDynamic { axis: &'static str, value: i64 },
+}
 
 #[derive(Debug, Error)]
 pub enum TrtError {
@@ -8,10 +22,10 @@ pub enum TrtError {
     Cxx(#[from] cxx::Exception),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("null pointer error: {0}")]
-    NullPtr(&'static str),
-    #[error("API failed: {0}")]
-    Api(&'static str),
+    #[error("Shape error: {0}")]
+    Shape(#[from] ShapeError),
+    #[error("API error: {0}")]
+    Api(String),
 }
 
 pub type TrtResult<T> = Result<T, TrtError>;
@@ -19,6 +33,8 @@ pub type TrtResult<T> = Result<T, TrtError>;
 #[cxx::bridge]
 mod ffi {
     #[repr(i32)]
+    #[derive(Debug, Clone, Copy)]
+
     enum Severity {
         /// An internal error has occurred. Execution is unrecoverable.
         #[cxx_name = "kINTERNAL_ERROR"]
@@ -39,6 +55,8 @@ mod ffi {
 
     #[repr(i32)]
     #[namespace = "nvinfer1"]
+    #[derive(Debug, Clone, Copy)]
+
     enum DataType {
         #[cxx_name = "kFLOAT"]
         Float = 0,
@@ -67,6 +85,8 @@ mod ffi {
 
     #[repr(i32)]
     #[namespace = "nvinfer1"]
+    #[derive(Debug, Clone, Copy)]
+
     enum TensorLocation {
         #[cxx_name = "kDEVICE"]
         Device = 0,
@@ -77,6 +97,8 @@ mod ffi {
     #[repr(i32)]
     #[namespace = "nvinfer1"]
     #[cxx_name = "TensorIOMode"]
+    #[derive(Debug, Clone, Copy)]
+
     enum TensorIoMode {
         #[cxx_name = "kNONE"]
         None = 0,
@@ -88,6 +110,8 @@ mod ffi {
 
     #[repr(i32)]
     #[namespace = "nvinfer1"]
+    #[derive(Debug, Clone, Copy)]
+
     enum TensorFormat {
         /// Memory layout is similar to an array in C or C++.
         /// The stride of each dimension is the product of the dimensions after it.
@@ -210,6 +234,8 @@ mod ffi {
 
     #[repr(i32)]
     #[namespace = "nvinfer1"]
+    #[derive(Debug, Clone, Copy)]
+
     enum OptProfileSelector {
         #[cxx_name = "kMIN"]
         Min = 0,
@@ -217,14 +243,6 @@ mod ffi {
         Opt = 1,
         #[cxx_name = "kMAX"]
         Max = 2,
-    }
-
-    #[repr(i32)]
-    #[namespace = "nvinfer1"]
-    enum ExecutionContextAllocationStrategy {
-        kSTATIC = 0,
-        kON_PROFILE_CHANGE = 1,
-        kUSER_MANAGED = 2,
     }
 
     unsafe extern "C++" {
@@ -250,8 +268,6 @@ mod ffi {
         type TensorFormat;
         #[namespace = "nvinfer1"]
         type OptProfileSelector;
-        #[namespace = "nvinfer1"]
-        type ExecutionContextAllocationStrategy;
 
         // classes
         #[namespace = "nvinfer1"]
@@ -264,10 +280,16 @@ mod ffi {
         type IExecutionContext;
 
         // methods
-        fn new_dims(dims_spec: &[i32]) -> Result<UniquePtr<Dims>>;
-        fn reshape_dims(dims: &UniquePtr<Dims>, dims_spec: &[i32]) -> Result<()>;
+        fn dims_new(spec: &[i64]) -> Result<UniquePtr<Dims>>;
+        fn dims_invalid() -> Result<UniquePtr<Dims>>;
+        fn dims_clone(dims: &UniquePtr<Dims>) -> Result<UniquePtr<Dims>>;
+        fn dims_nb_dims(dims: &UniquePtr<Dims>) -> i32;
+        fn dims_get_axis(dims: &UniquePtr<Dims>, idx: usize) -> Result<i64>;
+        fn dims_set_axis(dims: &UniquePtr<Dims>, idx: usize, val: i64) -> Result<()>;
+        fn dims_is_invalid(dims: &UniquePtr<Dims>) -> bool;
+        fn dims_is_unknown_rank(dims: &UniquePtr<Dims>) -> bool;
 
-        fn new_logger(log_level: Severity) -> Result<UniquePtr<Logger>>;
+        fn logger_new(log_level: Severity) -> Result<UniquePtr<Logger>>;
 
         fn create_infer_runtime(logger: &UniquePtr<Logger>) -> Result<UniquePtr<IRuntime>>;
 
@@ -276,12 +298,9 @@ mod ffi {
             data: &[u8],
         ) -> Result<UniquePtr<ICudaEngine>>;
 
-        #[namespace = "nvinfer1"]
-        #[rust_name = "create_execution_context"]
-        fn createExecutionContext(
-            self: Pin<&mut ICudaEngine>,
-            strategy: ExecutionContextAllocationStrategy,
-        ) -> *mut IExecutionContext;
+        fn engine_create_execution_context(
+            engine: &UniquePtr<ICudaEngine>,
+        ) -> Result<UniquePtr<IExecutionContext>>;
 
         unsafe fn engine_get_tensor_shape(
             engine: &UniquePtr<ICudaEngine>,
@@ -405,214 +424,503 @@ pub type TensorIoMode = ffi::TensorIoMode;
 pub type TensorFormat = ffi::TensorFormat;
 pub type OptProfileSelector = ffi::OptProfileSelector;
 
-pub struct Dims {
-    inner: UniquePtr<ffi::Dims>,
+impl DataType {
+    pub fn size_bytes(self) -> usize {
+        match self {
+            DataType::Float => 4,
+            DataType::Half => 2,
+            DataType::Int8 => 1,
+            DataType::Int32 => 4,
+            DataType::Bool => 1,
+            DataType::Uint8 => 1,
+            DataType::Fp8 => 1,
+            DataType::Bf16 => 2,
+            DataType::Int64 => 8,
+            DataType::Int4 => 0, // special case
+        }
+    }
 }
 
-impl Dims {
-    fn from_raw(dims: UniquePtr<ffi::Dims>) -> Self {
-        Self { inner: dims }
+#[derive(Debug, Clone, Copy)]
+pub enum Axis {
+    Batch,
+    Channel,
+    Depth,
+    Height,
+    Width,
+}
+
+impl Axis {
+    pub fn name(self) -> &'static str {
+        match self {
+            Axis::Batch => "batch",
+            Axis::Channel => "channel",
+            Axis::Depth => "depth",
+            Axis::Height => "height",
+            Axis::Width => "width",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AxisLayout {
+    N,
+    NC,
+    NCL, // 1D conv
+    NCHW,
+    NHWC,
+    NCDHW,
+    NDHWC,
+}
+
+impl AxisLayout {
+    fn from_format_and_rank(format: TensorFormat, rank: i32) -> Self {
+        match format {
+            // 4D, channel-minor
+            TensorFormat::Hwc | TensorFormat::Hwc8 | TensorFormat::Hwc16 => Self::NHWC,
+
+            // volumetric, channel-minor
+            TensorFormat::Dhwc | TensorFormat::Dhwc8 => Self::NDHWC,
+
+            // volumetric, channel-major
+            TensorFormat::Cdhw32 => Self::NCDHW,
+
+            // linear & CHW* variants, channel-major
+            TensorFormat::Linear
+            | TensorFormat::Chw2
+            | TensorFormat::Chw4
+            | TensorFormat::Chw16
+            | TensorFormat::Chw32
+            | TensorFormat::DlaLinear
+            | TensorFormat::DlaHwc4 => match rank {
+                1 => Self::N,
+                2 => Self::NC,
+                3 => Self::NCL,
+                4 => Self::NCHW,
+                _ => Self::NCHW, // best effort
+            },
+        }
     }
 
-    pub fn new(dims_spec: &[i32]) -> TrtResult<Self> {
+    fn index_of(self, axis: Axis) -> Option<usize> {
+        match (self, axis) {
+            (_, Axis::Batch) => Some(0), // batch precedes all axes
+
+            (Self::NCHW | Self::NC | Self::NCL | Self::NCDHW, Axis::Channel) => Some(1),
+            (Self::NHWC, Axis::Channel) => Some(3),
+            (Self::NDHWC, Axis::Channel) => Some(4),
+
+            (Self::NCHW, Axis::Height) => Some(2),
+            (Self::NHWC, Axis::Height) => Some(1),
+            (Self::NCDHW, Axis::Height) => Some(3),
+            (Self::NDHWC, Axis::Height) => Some(2),
+            (Self::NCL, Axis::Height) => Some(2), // "length"
+
+            (Self::NCHW, Axis::Width) => Some(3),
+            (Self::NHWC, Axis::Width) => Some(2),
+            (Self::NCDHW, Axis::Width) => Some(4),
+            (Self::NDHWC, Axis::Width) => Some(3),
+
+            (Self::NCDHW, Axis::Depth) => Some(2),
+            (Self::NDHWC, Axis::Depth) => Some(1),
+
+            _ => None,
+        }
+    }
+}
+
+pub struct Shape {
+    dims: UniquePtr<ffi::Dims>,
+    layout: AxisLayout,
+}
+
+impl Shape {
+    pub fn try_new(spec: &[i64], format: TensorFormat) -> TrtResult<Self> {
+        let rank = spec.len();
+        let dims = ffi::dims_new(spec)?;
+        let layout = AxisLayout::from_format_and_rank(format, rank as i32);
+
+        Ok(Self { dims, layout })
+    }
+
+    fn from_dims(dims: UniquePtr<ffi::Dims>, format: TensorFormat) -> Self {
+        let rank = ffi::dims_nb_dims(&dims);
+        let layout = AxisLayout::from_format_and_rank(format, rank);
+
+        Self { dims, layout }
+    }
+
+    pub fn try_clone(&self) -> TrtResult<Self> {
+        let dims = ffi::dims_clone(&self.dims)?;
         Ok(Self {
-            inner: ffi::new_dims(dims_spec)?,
+            dims,
+            layout: self.layout,
         })
     }
 
-    pub fn reshape(&mut self, dims_spec: &[i32]) -> TrtResult<()> {
-        ffi::reshape_dims(&self.inner, dims_spec)?;
-        Ok(())
+    pub fn is_invalid(&self) -> bool {
+        ffi::dims_is_invalid(&self.dims)
+    }
+
+    pub fn is_unknown_rank(&self) -> bool {
+        ffi::dims_is_unknown_rank(&self.dims)
+    }
+
+    pub fn rank(&self) -> usize {
+        ffi::dims_nb_dims(&self.dims) as usize
+    }
+
+    pub fn get(&self, idx: usize) -> TrtResult<i64> {
+        Ok(ffi::dims_get_axis(&self.dims, idx)?)
+    }
+
+    pub fn set(&mut self, idx: usize, value: i64) -> TrtResult<()> {
+        Ok(ffi::dims_set_axis(&self.dims, idx, value)?)
+    }
+
+    fn get_axis(&self, axis: Axis) -> TrtResult<i64> {
+        let idx = self.layout.index_of(axis).ok_or(ShapeError::NoSuchAxis {
+            axis: axis.name(),
+            rank: self.rank(),
+        })?;
+
+        self.get(idx)
+    }
+
+    fn set_axis(&mut self, axis: Axis, value: i64) -> TrtResult<()> {
+        let idx = self.layout.index_of(axis).ok_or(ShapeError::NoSuchAxis {
+            axis: axis.name(),
+            rank: self.rank(),
+        })?;
+
+        let current = self.get(idx)?;
+        if current != -1 {
+            return Err(ShapeError::NotDynamic {
+                axis: axis.name(),
+                value: current,
+            }
+            .into());
+        }
+
+        self.set(idx, value)
+    }
+
+    pub fn batch(&self) -> TrtResult<i64> {
+        self.get_axis(Axis::Batch)
+    }
+
+    pub fn channels(&self) -> TrtResult<i64> {
+        self.get_axis(Axis::Channel)
+    }
+
+    pub fn depth(&self) -> TrtResult<i64> {
+        self.get_axis(Axis::Depth)
+    }
+
+    pub fn height(&self) -> TrtResult<i64> {
+        self.get_axis(Axis::Height)
+    }
+
+    pub fn width(&self) -> TrtResult<i64> {
+        self.get_axis(Axis::Width)
+    }
+
+    pub fn set_batch(&mut self, value: i64) -> TrtResult<()> {
+        self.set_axis(Axis::Batch, value)
+    }
+
+    pub fn set_channels(&mut self, value: i64) -> TrtResult<()> {
+        self.set_axis(Axis::Channel, value)
+    }
+
+    pub fn set_depth(&mut self, value: i64) -> TrtResult<()> {
+        self.set_axis(Axis::Depth, value)
+    }
+
+    pub fn set_height(&mut self, value: i64) -> TrtResult<()> {
+        self.set_axis(Axis::Height, value)
+    }
+
+    pub fn set_width(&mut self, value: i64) -> TrtResult<()> {
+        self.set_axis(Axis::Width, value)
+    }
+
+    pub fn set_nchw(&mut self, n: i64, c: i64, h: i64, w: i64) -> TrtResult<()> {
+        self.set_batch(n)?;
+        self.set_channels(c)?;
+        self.set_height(h)?;
+        self.set_width(w)
+    }
+
+    pub fn numel(&self) -> Option<usize> {
+        (0..self.rank()).try_fold(1usize, |acc, i| {
+            let value = self.get(i).ok()?;
+            if value < 0 {
+                return None;
+            }
+            acc.checked_mul(value as usize)
+        })
+    }
+
+    pub fn numel_except(&self, axis: Axis) -> Option<usize> {
+        let skip_idx = self.layout.index_of(axis);
+
+        (0..self.rank()).try_fold(1usize, |acc, i| {
+            if Some(i) == skip {
+                return Some(acc);
+            }
+            let value = self.get(i).ok()?;
+            if value < 0 {
+                return None;
+            }
+            acc.checked_mul(value as usize)
+        })
+    }
+}
+
+pub struct TensorInfo {
+    name: CString,
+    shape: Shape,
+    dtype: DataType,
+    io_mode: TensorIoMode,
+    location: TensorLocation,
+}
+
+impl TensorInfo {
+    pub fn name(&self) -> &str {
+        self.name.to_str().unwrap_or(UNNAMED_TENSOR)
+    }
+
+    pub fn shape(&self) -> &Shape {
+        &self.shape
+    }
+
+    pub fn dtype(&self) -> DataType {
+        self.dtype
+    }
+
+    pub fn io_mode(&self) -> TensorIoMode {
+        self.io_mode
+    }
+
+    pub fn location(&self) -> TensorLocation {
+        self.location
+    }
+
+    pub fn is_input(&self) -> bool {
+        self.io_mode == TensorIoMode::Input
+    }
+
+    pub fn is_output(&self) -> bool {
+        self.io_mode == TensorIoMode::Output
+    }
+
+    pub fn is_dynamic(&self) -> bool {
+        self.shape.numel().is_none() // >=1 axes are =-1
     }
 }
 
 pub struct Engine {
+    tensors: Vec<TensorInfo>,
     engine: UniquePtr<ffi::ICudaEngine>,
     _runtime: UniquePtr<ffi::IRuntime>,
     _logger: UniquePtr<ffi::Logger>,
 }
 
 impl Engine {
-    pub fn new(path: std::path::PathBuf, log_level: LogLevel) -> TrtResult<Self> {
+    pub fn load<P: AsRef<Path>>(path: P, log_level: LogLevel) -> TrtResult<Self> {
         let serialized_engine = std::fs::read(path)?;
-
-        let logger = ffi::new_logger(log_level)?;
+        let logger = ffi::logger_new(log_level)?;
         let runtime = ffi::create_infer_runtime(&logger)?;
         let engine = ffi::runtime_deserialize_cuda_engine(&runtime, &serialized_engine)?;
 
+        // snapshot all tensor info
+        let tensor_count = engine.get_nb_io_tensors();
+        let mut tensors = Vec::with_capacity(tensor_count as usize);
+        for i in 0..tensor_count {
+            // get name
+            let name = engine.get_io_tensor_name(i);
+            let name = unsafe { CStr::from_ptr(name) };
+            let name = name.to_owned();
+
+            // other attributes
+            let format = unsafe { engine.get_tensor_format1(name.as_ptr()) };
+            let dims = unsafe { ffi::engine_get_tensor_shape(&engine, name.as_ptr()) };
+
+            tensors.push(TensorInfo {
+                shape: Shape::from_dims(dims, format),
+                dtype: unsafe { engine.get_tensor_data_type(name.as_ptr()) },
+                io_mode: unsafe { engine.get_tensor_io_mode(name.as_ptr()) },
+                location: unsafe { engine.get_tensor_location(name.as_ptr()) },
+                name,
+            })
+        }
+
         Ok(Self {
+            tensors,
             engine,
             _runtime: runtime,
             _logger: logger,
         })
     }
 
-    pub fn create_execution_context(&mut self) -> TrtResult<ExecutionContext> {
-        let ctx = self
-            .engine
-            .as_mut()
-            .expect("FFI: engine should be non-null")
-            .create_execution_context(ffi::ExecutionContextAllocationStrategy::kSTATIC);
+    pub fn tensors(&self) -> &[TensorInfo] {
+        &self.tensors
+    }
 
-        if ctx.is_null() {
-            return Err(TrtError::NullPtr("could not create execution context"));
-        }
+    pub fn inputs(&self) -> impl Iterator<Item = &TensorInfo> {
+        self.tensors
+            .iter()
+            .filter(|t| t.io_mode == TensorIoMode::Input)
+    }
 
-        Ok(ExecutionContext {
-            ctx: unsafe { UniquePtr::from_raw(ctx) },
+    pub fn outputs(&self) -> impl Iterator<Item = &TensorInfo> {
+        self.tensors
+            .iter()
+            .filter(|t| t.io_mode == TensorIoMode::Output)
+    }
+
+    pub fn tensor(&self, name: &str) -> Option<&TensorInfo> {
+        self.tensors.iter().find(|t| t.name() == name)
+    }
+
+    pub fn first_input(&self) -> Option<&TensorInfo> {
+        self.inputs().next()
+    }
+
+    pub fn first_output(&self) -> Option<&TensorInfo> {
+        self.outputs().next()
+    }
+}
+
+pub trait DeviceAllocator {
+    fn allocate(&mut self, bytes: usize) -> TrtResult<*mut c_void>;
+    fn free(&mut self, ptr: &mut c_void) -> TrtResult<()>;
+}
+
+pub struct TensorBinding {
+    pub ptr: *mut c_void,
+    pub shape: Shape,
+    pub dtype: DataType,
+    pub bytes: usize,
+}
+
+impl TensorBinding {
+    pub fn ptr() -> *mut c_void {
+        self.ptr
+    }
+
+    pub fn shape() -> &Shape {
+        &self.shape
+    }
+
+    pub fn shape_mut() -> &mut Shape {
+        &mut self.shape
+    }
+
+    pub fn dtype(&self) -> DataType {
+        self.dtype
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+pub struct SharedContext<D: DeviceAllocator> {
+    ctx: UniquePtr<ffi::IExecutionContext>,
+    engine: Arc<Engine>,
+    allocator: D,
+    bindings: HashMap<CString, TensorBinding>,
+}
+
+impl<D: DeviceAllocator> SharedContext {
+    pub fn new(engine: &Arc<Engine>, allocator: D) -> TrtResult<Self> {
+        let ctx = ffi::engine_create_execution_context(&engine.engine)?;
+
+        Ok(Self {
+            ctx,
+            engine: Arc::clone(engine),
+            allocator,
+            bindings: HashMap::new(),
         })
     }
 
-    pub fn get_tensor_shape(&self, tensor_name: &CStr) -> Dims {
-        let dims = unsafe { ffi::engine_get_tensor_shape(&self.engine, tensor_name.as_ptr()) };
-        Dims::from_raw(dims)
+    pub fn bind_device_ptr(&mut self, name: &str, ptr: *mut c_void, shape: Shape) -> TrtResult<()> {
+        let info = self
+            .engine
+            .tensor(name)
+            .ok_or(TrtError::Api(format!("unknown tensor name: '{}'", name)))?;
+
+        let numel = shape.numel().ok_or(TrtError::Api(format!(
+            "shape for tensor '{}' still has dynamic axes",
+            name
+        )))?;
+
+        let bytes = numel * info.dtype.size_bytes();
+        self.bindings.insert(
+            info.name.clone(),
+            TensorBinding {
+                ptr,
+                shape,
+                dtype: info.dtype,
+                bytes,
+            },
+        );
+
+        Ok(())
     }
 
-    pub fn get_tensor_data_type(&self, tensor_name: &CStr) -> DataType {
-        unsafe { self.engine.get_tensor_data_type(tensor_name.as_ptr()) }
+    pub fn allocate(&mut self, name: &str, shape: Shape) -> TrtResult<()> {
+        let info = self
+            .engine
+            .tensor(name)
+            .ok_or(TrtError::Api(format!("unknown tensor name: '{}'", name)))?;
+
+        let numel = shape.numel().ok_or(TrtError::Api(format!(
+            "shape for tensor '{}' still has dynamic axes",
+            name
+        )))?;
+
+        let bytes = numel * info.dtype.size_bytes();
+        self.bindings.insert(
+            info.name.clone(),
+            TensorBinding {
+                ptr,
+                shape,
+                dtype: info.dtype,
+                bytes,
+            },
+        );
+
+        Ok(())
     }
 
-    pub fn get_tensor_location(&self, tensor_name: &CStr) -> TensorLocation {
-        unsafe { self.engine.get_tensor_location(tensor_name.as_ptr()) }
-    }
+    pub fn allocate_all(&mut self) -> TrtResult<()> {
+        let infos: Vec<_> = self
+            .engine
+            .tensors()
+            .iter()
+            .map(|t| (t.name.clone(), t.shape().try_clone()?))
+            .collect();
 
-    pub fn get_tensor_io_mode(&self, tensor_name: &CStr) -> TensorIoMode {
-        unsafe { self.engine.get_tensor_io_mode(tensor_name.as_ptr()) }
-    }
-
-    pub fn get_tensor_bytes_per_component(&self, tensor_name: &CStr) -> i32 {
-        unsafe {
-            self.engine
-                .get_tensor_bytes_per_component1(tensor_name.as_ptr())
+        for (name, shape) in infos {
+            self.allocate(name.to_str().unwrap_or(UNNAMED_TENSOR), shape)?;
         }
+
+        Ok(())
     }
 
-    pub fn get_tensor_bytes_per_component_for_profile(
-        &self,
-        tensor_name: &CStr,
-        profile_index: i32,
-    ) -> i32 {
+    pub fn reshape(&mut self, name: &str, shape: Shape) -> TrtResult<()> {}
+
+    pub unsafe fn enqueue(&mut self, stream: *mut c_void) -> TrtResult<()> {
         unsafe {
-            self.engine
-                .get_tensor_bytes_per_component2(tensor_name.as_ptr(), profile_index)
-        }
-    }
-
-    pub fn get_tensor_components_per_element(&self, tensor_name: &CStr) -> i32 {
-        unsafe {
-            self.engine
-                .get_tensor_components_per_element1(tensor_name.as_ptr())
-        }
-    }
-
-    pub fn get_tensor_components_per_element_for_profile(
-        &self,
-        tensor_name: &CStr,
-        profile_index: i32,
-    ) -> i32 {
-        unsafe {
-            self.engine
-                .get_tensor_components_per_element2(tensor_name.as_ptr(), profile_index)
-        }
-    }
-
-    pub fn get_tensor_format(&self, tensor_name: &CStr) -> TensorFormat {
-        unsafe { self.engine.get_tensor_format1(tensor_name.as_ptr()) }
-    }
-
-    pub fn get_tensor_format_for_profile(
-        &self,
-        tensor_name: &CStr,
-        profile_index: i32,
-    ) -> TensorFormat {
-        unsafe {
-            self.engine
-                .get_tensor_format2(tensor_name.as_ptr(), profile_index)
-        }
-    }
-
-    pub fn get_tensor_vectorized_dim(&self, tensor_name: &CStr) -> i32 {
-        unsafe { self.engine.get_tensor_vectorized_dim1(tensor_name.as_ptr()) }
-    }
-
-    pub fn get_tensor_vectorized_dim_for_profile(
-        &self,
-        tensor_name: &CStr,
-        profile_index: i32,
-    ) -> i32 {
-        unsafe {
-            self.engine
-                .get_tensor_vectorized_dim2(tensor_name.as_ptr(), profile_index)
-        }
-    }
-
-    pub fn get_profile_count(&self) -> i32 {
-        self.engine.get_nb_optimization_profiles()
-    }
-
-    pub fn get_profile_shape(
-        &self,
-        tensor_name: &CStr,
-        profile_index: i32,
-        optimization_selector: OptProfileSelector,
-    ) -> Dims {
-        let dims = unsafe {
-            ffi::engine_get_profile_shape(
-                &self.engine,
-                tensor_name.as_ptr(),
-                profile_index,
-                optimization_selector,
-            )
-        };
-
-        Dims::from_raw(dims)
-    }
-
-    pub fn get_io_tensor_count(&self) -> i32 {
-        self.engine.get_nb_io_tensors()
-    }
-
-    pub fn get_tensor_name<'tensor>(&'tensor self, index: i32) -> &'tensor CStr {
-        let tensor_name = self.engine.get_io_tensor_name(index);
-        unsafe { CStr::from_ptr(tensor_name) }
-    }
-}
-
-pub struct ExecutionContext {
-    ctx: UniquePtr<ffi::IExecutionContext>,
-}
-
-impl ExecutionContext {
-    pub fn set_tensor_address(
-        &mut self,
-        tensor_name: &CStr,
-        addr: *const std::ffi::c_void,
-    ) -> TrtResult<()> {
-        let ok = unsafe {
-            ffi::context_set_tensor_address(&self.ctx, tensor_name.as_ptr(), addr as usize)
-        };
-
-        ok.then_some(())
-            .ok_or(TrtError::Api("could not set tensor address"))
-    }
-
-    pub fn set_input_shape(&mut self, tensor_name: &CStr, dims: Dims) -> TrtResult<()> {
-        let ok =
-            unsafe { ffi::context_set_input_shape(&self.ctx, tensor_name.as_ptr(), &dims.inner) };
-
-        ok.then_some(())
-            .ok_or(TrtError::Api("could not set input shape"))
-    }
-
-    pub fn enqueue(&mut self, stream: *mut c_void) -> TrtResult<()> {
-        let ok = unsafe {
             self.ctx
                 .as_mut()
-                .expect("FFI: context should be non-null")
+                .expect("ffi: context should be non-null")
                 .enqueue_v3(stream.cast())
-        };
-
-        ok.then_some(())
-            .ok_or(TrtError::Api("could not enqueue inference"))
+                .then_some(())
+                .ok_or(TrtError::Api("enqueue failed".to_owned()))
+        }
     }
 }
