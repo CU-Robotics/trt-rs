@@ -295,8 +295,9 @@ mod ffi {
         // methods
         fn dims_new(spec: &[i64]) -> Result<UniquePtr<Dims>>;
         fn dims_copy_from_slice(dims: &UniquePtr<Dims>, spec: &[i64]);
-        fn dims_invalid() -> Result<UniquePtr<Dims>>;
         fn dims_copy(src: &UniquePtr<Dims>, dest: &UniquePtr<Dims>);
+        fn dims_as_slice(dims: &UniquePtr<Dims>) -> &[i64];
+        fn dims_invalid() -> Result<UniquePtr<Dims>>;
         fn dims_clone(dims: &UniquePtr<Dims>) -> Result<UniquePtr<Dims>>;
         fn dims_nb_dims(dims: &UniquePtr<Dims>) -> i32;
         fn dims_get_axis(dims: &UniquePtr<Dims>, idx: usize) -> Result<i64>;
@@ -589,6 +590,10 @@ impl Shape {
         Ok(())
     }
 
+    pub fn as_slice(&self) -> &[i64] {
+        ffi::dims_as_slice(&self.dims)
+    }
+
     pub fn try_clone(&self) -> TrtResult<Self> {
         let dims = ffi::dims_clone(&self.dims)?;
         Ok(Self {
@@ -806,7 +811,10 @@ unsafe impl Send for Engine {}
 unsafe impl Sync for Engine {}
 
 impl Engine {
-    pub fn load<P: AsRef<std::path::Path>>(path: P, log_level: LogLevel) -> TrtResult<Self> {
+    pub fn try_new<P: AsRef<std::path::Path>>(
+        path: P,
+        log_level: LogLevel,
+    ) -> TrtResult<Arc<Self>> {
         let serialized_engine = std::fs::read(path)?;
         let logger = ffi::logger_new(log_level)?;
         let runtime = ffi::create_infer_runtime(&logger)?;
@@ -893,7 +901,7 @@ impl Engine {
             _ => None,
         };
 
-        Ok(Self {
+        Ok(Arc::new(Self {
             only_input_id,
             only_output_id,
             tensor_ids,
@@ -901,7 +909,7 @@ impl Engine {
             engine,
             _runtime: runtime,
             _logger: logger,
-        })
+        }))
     }
 
     pub fn opt_profile_count(&self) -> usize {
@@ -981,7 +989,7 @@ pub struct ExecutionContext<A: DeviceAllocator> {
 }
 
 impl<A: DeviceAllocator> ExecutionContext<A> {
-    pub fn new(engine: &Arc<Engine>, allocator: A) -> TrtResult<Self> {
+    pub fn try_new(engine: &Arc<Engine>, allocator: A) -> TrtResult<Self> {
         // createExecutionContext is non-const but documented as threadsafe
         let ctx = ffi::engine_create_execution_context(&engine.engine)?;
 

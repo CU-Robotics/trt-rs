@@ -21,6 +21,11 @@ void dims_copy(const std::unique_ptr<nvinfer1::Dims> &src, const std::unique_ptr
     std::copy(std::begin(src->d), std::end(src->d), std::begin(dest->d));
 }
 
+rust::Slice<const int64_t> dims_as_slice(const std::unique_ptr<nvinfer1::Dims> &dims)
+{
+    return rust::Slice<const int64_t>{dims->d, std::max(0, dims->nbDims)};
+}
+
 std::unique_ptr<nvinfer1::Dims> dims_invalid()
 {
     nvinfer1::Dims dims{};
