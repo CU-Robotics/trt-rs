@@ -1,17 +1,24 @@
 #include <algorithm>
 #include <ranges>
-#include <span>
 #include "trt.hpp"
 
 std::unique_ptr<nvinfer1::Dims> dims_new(rust::Slice<const int64_t> spec)
 {
-    nvinfer1::Dims dims{};
+    auto dims = std::make_unique<nvinfer1::Dims>(); // can throw
+    dims_copy_from_slice(dims, spec);
+    return dims;
+}
 
-    dims.nbDims = std::min(static_cast<int32_t>(spec.length()), dims.MAX_DIMS);
-    std::ranges::copy(spec | std::views::take(dims.MAX_DIMS), dims.d);
+void dims_copy_from_slice(const std::unique_ptr<nvinfer1::Dims> &dims, rust::Slice<const int64_t> spec)
+{
+    dims->nbDims = std::min(static_cast<int32_t>(spec.length()), dims->MAX_DIMS);
+    std::ranges::copy(spec | std::views::take(dims->MAX_DIMS), dims->d);
+}
 
-    // can throw
-    return std::make_unique<nvinfer1::Dims>(dims);
+void dims_copy(const std::unique_ptr<nvinfer1::Dims> &src, const std::unique_ptr<nvinfer1::Dims> &dest)
+{
+    dest->nbDims = src->nbDims;
+    std::copy(std::begin(src->d), std::end(src->d), std::begin(dest->d));
 }
 
 std::unique_ptr<nvinfer1::Dims> dims_invalid()
@@ -33,12 +40,18 @@ int32_t dims_nb_dims(const std::unique_ptr<nvinfer1::Dims> &dims)
 
 int64_t dims_get_axis(const std::unique_ptr<nvinfer1::Dims> &dims, size_t idx)
 {
-    return std::span(dims->d, dims->nbDims).at(idx); // can throw
+    if (idx >= dims->MAX_DIMS)
+        throw std::out_of_range("axis index is out of range");
+
+    return dims->d[idx];
 }
 
 void dims_set_axis(const std::unique_ptr<nvinfer1::Dims> &dims, size_t idx, int64_t val)
 {
-    std::span(dims->d, dims->nbDims).at(idx) = val; // can throw
+    if (idx >= dims->MAX_DIMS)
+        throw std::out_of_range("axis index is out of range");
+
+    dims->d[idx] = val;
 }
 
 bool dims_is_invalid(const std::unique_ptr<nvinfer1::Dims> &dims)

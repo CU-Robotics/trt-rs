@@ -48,6 +48,8 @@ public:
 using Severity = nvinfer1::ILogger::Severity;
 
 std::unique_ptr<nvinfer1::Dims> dims_new(rust::Slice<const int64_t> spec);
+void dims_copy_from_slice(const std::unique_ptr<nvinfer1::Dims> &dims, rust::Slice<const int64_t> spec);
+void dims_copy(const std::unique_ptr<nvinfer1::Dims> &src, const std::unique_ptr<nvinfer1::Dims> &dest);
 std::unique_ptr<nvinfer1::Dims> dims_invalid();
 std::unique_ptr<nvinfer1::Dims> dims_clone(const std::unique_ptr<nvinfer1::Dims> &dims);
 int32_t dims_nb_dims(const std::unique_ptr<nvinfer1::Dims> &dims);
