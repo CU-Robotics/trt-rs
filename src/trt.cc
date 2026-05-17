@@ -116,7 +116,7 @@ bool context_set_tensor_address(const std::unique_ptr<nvinfer1::IExecutionContex
     return context->setTensorAddress(tensor_name, ptr);
 }
 
-bool context_set_input_shape(const std::unique_ptr<nvinfer1::IExecutionContext> &context, const char *tensor_name, const std::unique_ptr<nvinfer1::Dims> dims)
+bool context_set_input_shape(const std::unique_ptr<nvinfer1::IExecutionContext> &context, const char *tensor_name, const std::unique_ptr<nvinfer1::Dims> &dims)
 {
     return context->setInputShape(tensor_name, *dims);
 }

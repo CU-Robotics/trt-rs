@@ -22,6 +22,14 @@ To support this model, the following operations are thread-safe:
 const UNNAMED_TENSOR: &str = "[unnamed tensor]";
 
 #[derive(Debug, Error)]
+pub enum AllocationError {
+    #[error("provided malloc impl failed: {0}")]
+    Malloc(String),
+    #[error("provided free impl failed: {0}")]
+    Free(String),
+}
+
+#[derive(Debug, Error)]
 pub enum ShapeError {
     #[error("axis '{axis}' does not exist for rank-{rank} tensor")]
     NoSuchAxis { axis: &'static str, rank: usize },
@@ -33,12 +41,12 @@ pub enum TrtError {
     Cxx(#[from] cxx::Exception),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("Shape error: {0}")]
+    #[error("shape error: {0}")]
     Shape(#[from] ShapeError),
     #[error("API error: {0}")]
     Api(String),
-    #[error("Allocation error")]
-    Alloc,
+    #[error("TensorRT allocator error: {0}")]
+    Alloc(#[from] AllocationError),
 }
 
 pub type TrtResult<T> = Result<T, TrtError>;
@@ -442,6 +450,10 @@ mod ffi {
         #[namespace = "nvinfer1"]
         #[rust_name = "get_max_output_size"]
         unsafe fn getMaxOutputSize(self: &IExecutionContext, tensor_name: *const c_char) -> i64;
+
+        #[namespace = "nvinfer1"]
+        #[rust_name = "get_optimization_profile"]
+        fn getOptimizationProfile(self: &IExecutionContext) -> i32;
     }
 }
 
@@ -492,7 +504,7 @@ impl Axis {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum AxisLayout {
+pub enum AxisLayout {
     N,
     NC,
     NCL, // 1D conv
@@ -579,6 +591,10 @@ impl Shape {
         let layout = AxisLayout::from_format_and_rank(format, rank);
 
         Self { dims, layout }
+    }
+
+    pub fn layout(&self) -> AxisLayout {
+        self.layout
     }
 
     pub fn copy(&mut self, other: &Shape) -> TrtResult<()> {
@@ -701,7 +717,7 @@ impl Shape {
         let skip_idx = self.layout.index_of(axis);
 
         (0..self.rank()).try_fold(1usize, |acc, i| {
-            if Some(i) == skip_idx {
+            if Some(i) <= skip_idx {
                 return Some(acc);
             }
             let value = self.get(i).ok()?;
@@ -717,6 +733,17 @@ impl Shape {
     }
 }
 
+impl std::fmt::Debug for Shape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_invalid() || self.is_unknown_rank() {
+            write!(f, "[undetermined shape]")
+        } else {
+            f.debug_list().entries(self.as_slice().iter()).finish()
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct ProfileShapes {
     min: Shape,
     opt: Shape,
@@ -740,6 +767,7 @@ impl ProfileShapes {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TensorId(pub usize);
 
+#[derive(Debug)]
 pub struct TensorInfo {
     id: TensorId,
     name: String,
@@ -795,10 +823,15 @@ impl TensorInfo {
     pub fn profile(&self, idx: usize) -> Option<&ProfileShapes> {
         self.profiles.get(idx)
     }
+
+    pub fn profiles(&self) -> &[ProfileShapes] {
+        &self.profiles
+    }
 }
 
 pub struct Engine {
     tensor_ids: HashMap<String, TensorId>,
+    tensor_names: HashMap<TensorId, String>,
     only_input_id: Option<TensorId>,  // fast path
     only_output_id: Option<TensorId>, // fast path
     tensors: Vec<TensorInfo>,
@@ -825,7 +858,9 @@ impl Engine {
         let tensor_count = engine.get_nb_io_tensors();
 
         let mut tensor_ids = HashMap::with_capacity(tensor_count as usize);
+        let mut tensor_names = HashMap::with_capacity(tensor_count as usize);
         let mut tensors = Vec::with_capacity(tensor_count as usize);
+
         for i in 0..tensor_count {
             let id = TensorId(i as usize);
 
@@ -867,6 +902,8 @@ impl Engine {
             );
 
             tensor_ids.insert(name.clone(), id);
+            tensor_names.insert(id, name.clone());
+
             tensors.push(TensorInfo {
                 id,
                 dtype: unsafe { engine.get_tensor_data_type(ffi_name.as_ptr()) },
@@ -902,9 +939,10 @@ impl Engine {
         };
 
         Ok(Arc::new(Self {
+            tensor_ids,
+            tensor_names,
             only_input_id,
             only_output_id,
-            tensor_ids,
             tensors,
             engine,
             _runtime: runtime,
@@ -953,14 +991,23 @@ impl Engine {
     }
 }
 
-pub trait DeviceBuffer: Drop {
+impl std::fmt::Debug for Engine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Engine")
+            .field("tensors", &self.tensors)
+            .finish()
+    }
+}
+
+pub trait DeviceBuffer {
     fn ptr(&self) -> *mut c_void;
     fn size_bytes(&self) -> usize;
 }
 
 pub trait DeviceAllocator {
     type Buffer: DeviceBuffer;
-    fn allocate(&mut self, size_bytes: usize) -> TrtResult<Self::Buffer>;
+    fn allocate(size_bytes: usize) -> TrtResult<Self::Buffer>;
+    fn free(buffer: &Self::Buffer) -> TrtResult<()>;
 }
 
 pub struct TensorBinding<B: DeviceBuffer> {
@@ -982,20 +1029,18 @@ impl<B: DeviceBuffer> TensorBinding<B> {
 
 pub struct ExecutionContext<A: DeviceAllocator> {
     active_profile: usize,
-    allocator: A,
     bindings: Vec<Option<TensorBinding<A::Buffer>>>,
     ctx: UniquePtr<ffi::IExecutionContext>,
     engine: Arc<Engine>,
 }
 
 impl<A: DeviceAllocator> ExecutionContext<A> {
-    pub fn try_new(engine: &Arc<Engine>, allocator: A) -> TrtResult<Self> {
+    pub fn try_new(engine: &Arc<Engine>) -> TrtResult<Self> {
         // createExecutionContext is non-const but documented as threadsafe
         let ctx = ffi::engine_create_execution_context(&engine.engine)?;
 
         Ok(Self {
             active_profile: 0,
-            allocator,
             bindings: std::iter::repeat_with(|| None)
                 .take(engine.tensors().len())
                 .collect(),
@@ -1005,50 +1050,113 @@ impl<A: DeviceAllocator> ExecutionContext<A> {
     }
 
     pub fn allocate_max(&mut self) -> TrtResult<()> {
-        for tensor in self.engine.tensors() {
-            let profile = tensor
-                .profile(self.active_profile)
-                .ok_or(TrtError::Api(format!(
-                    "could not find profile {} for tensor with name '{}'",
-                    self.active_profile,
-                    tensor.name(),
-                )))?;
+        struct LocalTensorInfoCopy {
+            is_output: bool,
+            id: TensorId,
+            ffi_name: CString,
+            dtype: DataType,
+            max_shape: Shape,
+            opt_shape: Shape,
+        }
 
-            let max_bytes = if tensor.is_input() {
-                profile
-                    .max
-                    .numel()
-                    .map(|n| n * tensor.dtype().size_bytes())
+        // sort inputs before outputs
+        let mut tensor_infos = self
+            .engine
+            .tensors()
+            .iter()
+            .map(|tensor| {
+                let profile = tensor
+                    .profile(self.active_profile)
                     .ok_or(TrtError::Api(format!(
-                        "could not find max size for tensor '{}'",
+                        "could not find profile {} for tensor with name '{}'",
+                        self.active_profile,
                         tensor.name(),
-                    )))?
+                    )))?;
+
+                Ok(LocalTensorInfoCopy {
+                    is_output: tensor.is_output(),
+                    id: tensor.id(),
+                    ffi_name: tensor.ffi_name().to_owned().clone(),
+                    dtype: tensor.dtype(),
+                    max_shape: profile.max().try_clone()?,
+                    opt_shape: profile.opt().try_clone()?,
+                })
+            })
+            .collect::<TrtResult<Vec<_>>>()?;
+
+        // false < true
+        tensor_infos.sort_by_key(|t| t.is_output);
+
+        // allocate bindings for each tensor
+        for tensor in &tensor_infos {
+            let max_bytes = if tensor.is_output {
+                // all input shapes should be fully determined by now
+                let size_bytes =
+                    match unsafe { self.ctx.get_max_output_size(tensor.ffi_name.as_ptr()) } {
+                        -1 => Err(TrtError::Api(format!(
+                            "shape of output tensor with name '{:?}' is undetermined",
+                            tensor.ffi_name
+                        ))),
+                        n => Ok(n as usize),
+                    };
+
+                size_bytes?
             } else {
-                unsafe { self.ctx.get_max_output_size(tensor.ffi_name().as_ptr()) as usize }
+                // temporarily specify pessimistic input bounds to determine dynamic output bounds
+                unsafe {
+                    let _ = ffi::context_set_input_shape(
+                        &self.ctx,
+                        tensor.ffi_name.as_ptr(),
+                        &tensor.max_shape.dims,
+                    )
+                    .then_some(())
+                    .expect("ffi: MAX profile shape should be valid");
+                }
+
+                tensor
+                    .max_shape
+                    .numel()
+                    .map(|n| n * tensor.dtype.size_bytes())
+                    .ok_or(TrtError::Api(format!(
+                        "could not find max size for tensor '{:?}'",
+                        tensor.ffi_name,
+                    )))?
             };
 
-            let buffer = self.allocator.allocate(max_bytes)?;
-
+            let buffer = A::allocate(max_bytes)?;
             unsafe {
                 ffi::context_set_tensor_address(
                     &self.ctx,
-                    tensor.ffi_name().as_ptr(),
+                    tensor.ffi_name.as_ptr(),
                     buffer.ptr() as usize,
                 )
                 .then_some(())
                 .ok_or(TrtError::Api(format!(
-                    "could not set address for tensor with name '{}'",
-                    tensor.name()
+                    "could not set address for tensor with name '{:?}'",
+                    tensor.ffi_name
                 )))?;
             }
 
             // old bindings will get dropped if they exist
-            self.bindings[tensor.id().0] = Some(TensorBinding {
-                tensor_id: tensor.id(),
+            self.bindings[tensor.id.0] = Some(TensorBinding {
+                tensor_id: tensor.id,
                 buffer,
-                scratch_shape: profile.opt.try_clone()?,
-                runtime_shape: profile.opt.try_clone()?,
+                scratch_shape: tensor.opt_shape.try_clone()?,
+                runtime_shape: tensor.opt_shape.try_clone()?,
             });
+        }
+
+        // use opt shapes for all input tensors by default
+        for tensor in tensor_infos.iter().filter(|t| !t.is_output) {
+            unsafe {
+                let _ = ffi::context_set_input_shape(
+                    &self.ctx,
+                    tensor.ffi_name.as_ptr(),
+                    &tensor.opt_shape.dims,
+                )
+                .then_some(())
+                .expect("ffi: OPT profile shape should be valid");
+            }
         }
 
         Ok(())
@@ -1059,7 +1167,7 @@ impl<A: DeviceAllocator> ExecutionContext<A> {
     }
 
     pub fn only_output_binding(&self) -> Option<&TensorBinding<A::Buffer>> {
-        self.engine.only_input_id.and_then(|id| self.binding(id))
+        self.engine.only_output_id.and_then(|id| self.binding(id))
     }
 
     pub fn binding(&self, id: TensorId) -> Option<&TensorBinding<A::Buffer>> {
@@ -1170,5 +1278,9 @@ impl<A: DeviceAllocator> ExecutionContext<A> {
         self.active_profile = profile_index as usize;
 
         Ok(())
+    }
+
+    pub fn get_opt_profile(&self) -> i32 {
+        self.ctx.get_optimization_profile()
     }
 }
