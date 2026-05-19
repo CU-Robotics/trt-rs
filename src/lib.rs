@@ -44,7 +44,7 @@ pub enum TrtError {
     #[error("shape error: {0}")]
     Shape(#[from] ShapeError),
     #[error("API error: {0}")]
-    Api(String),
+    Api(&'static str),
     #[error("TensorRT allocator error: {0}")]
     Alloc(#[from] AllocationError),
 }
@@ -599,7 +599,7 @@ impl Shape {
 
     pub fn copy(&mut self, other: &Shape) -> TrtResult<()> {
         if self.layout != other.layout {
-            return Err(TrtError::Api("shape ranks do not match".to_owned()));
+            return Err(TrtError::Api("cannot copy shape, ranks do not match"));
         }
 
         ffi::dims_copy(&other.dims, &self.dims);
@@ -1067,11 +1067,7 @@ impl<A: DeviceAllocator> ExecutionContext<A> {
             .map(|tensor| {
                 let profile = tensor
                     .profile(self.active_profile)
-                    .ok_or(TrtError::Api(format!(
-                        "could not find profile {} for tensor with name '{}'",
-                        self.active_profile,
-                        tensor.name(),
-                    )))?;
+                    .ok_or(TrtError::Api("could not find active profile for tensor"))?;
 
                 Ok(LocalTensorInfoCopy {
                     is_output: tensor.is_output(),
@@ -1093,10 +1089,7 @@ impl<A: DeviceAllocator> ExecutionContext<A> {
                 // all input shapes should be fully determined by now
                 let size_bytes =
                     match unsafe { self.ctx.get_max_output_size(tensor.ffi_name.as_ptr()) } {
-                        -1 => Err(TrtError::Api(format!(
-                            "shape of output tensor with name '{:?}' is undetermined",
-                            tensor.ffi_name
-                        ))),
+                        -1 => Err(TrtError::Api("shape of output tensor is undetermined")),
                         n => Ok(n as usize),
                     };
 
@@ -1117,10 +1110,7 @@ impl<A: DeviceAllocator> ExecutionContext<A> {
                     .max_shape
                     .numel()
                     .map(|n| n * tensor.dtype.size_bytes())
-                    .ok_or(TrtError::Api(format!(
-                        "could not find max size for tensor '{:?}'",
-                        tensor.ffi_name,
-                    )))?
+                    .ok_or(TrtError::Api("could not find max size for tensor"))?
             };
 
             let buffer = A::allocate(max_bytes)?;
@@ -1131,10 +1121,7 @@ impl<A: DeviceAllocator> ExecutionContext<A> {
                     buffer.ptr() as usize,
                 )
                 .then_some(())
-                .ok_or(TrtError::Api(format!(
-                    "could not set address for tensor with name '{:?}'",
-                    tensor.ffi_name
-                )))?;
+                .ok_or(TrtError::Api("could not set address for tensor"))?;
             }
 
             // old bindings will get dropped if they exist
@@ -1186,19 +1173,13 @@ impl<A: DeviceAllocator> ExecutionContext<A> {
             .bindings
             .get_mut(id.0)
             .and_then(Option::as_mut)
-            .ok_or(TrtError::Api(format!(
-                "could not find binding with ID {}",
-                id.0
-            )))?;
+            .ok_or(TrtError::Api("could not find binding with given ID"))?;
 
         let tensor = self
             .engine
             .tensors
             .get(binding.tensor_id.0)
-            .ok_or(TrtError::Api(format!(
-                "could not match binding ID {} with tensor",
-                id.0
-            )))?;
+            .ok_or(TrtError::Api("could not match binding ID with tensor"))?;
 
         binding.scratch_shape.copy(&binding.runtime_shape)?;
         f(&mut binding.scratch_shape)?;
@@ -1210,10 +1191,7 @@ impl<A: DeviceAllocator> ExecutionContext<A> {
                 &binding.scratch_shape.dims,
             )
             .then_some(())
-            .ok_or(TrtError::Api(format!(
-                "could not set shape for tensor with ID {}",
-                id.0
-            )))?;
+            .ok_or(TrtError::Api("could not set shape for tensor"))?;
         }
 
         // commit result
@@ -1228,10 +1206,7 @@ impl<A: DeviceAllocator> ExecutionContext<A> {
         self.modify_input_shape(
             self.engine
                 .lookup_tensor_id(name)
-                .ok_or(TrtError::Api(format!(
-                    "could not find ID for tensor with name '{}'",
-                    name
-                )))?,
+                .ok_or(TrtError::Api("could not find ID for tensor"))?,
             f,
         )
     }
@@ -1257,7 +1232,7 @@ impl<A: DeviceAllocator> ExecutionContext<A> {
                 .expect("ffi: context should be non-null")
                 .enqueue_v3(stream.cast())
                 .then_some(())
-                .ok_or(TrtError::Api("enqueue failed".to_owned()))
+                .ok_or(TrtError::Api("enqueue failed"))
         }
     }
 
@@ -1272,7 +1247,7 @@ impl<A: DeviceAllocator> ExecutionContext<A> {
                 .expect("ffi: context should be non-null")
                 .set_optimization_profile_async(profile_index, stream.cast())
                 .then_some(())
-                .ok_or(TrtError::Api("profile select failed".to_owned()))?;
+                .ok_or(TrtError::Api("profile select failed"))?;
         }
 
         self.active_profile = profile_index as usize;
