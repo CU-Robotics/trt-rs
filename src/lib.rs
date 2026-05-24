@@ -454,6 +454,10 @@ mod ffi {
         #[namespace = "nvinfer1"]
         #[rust_name = "get_optimization_profile"]
         fn getOptimizationProfile(self: &IExecutionContext) -> i32;
+
+        #[namespace = "nvinfer1"]
+        #[rust_name = "set_enqueue_emits_profile"]
+        fn setEnqueueEmitsProfile(self: Pin<&mut IExecutionContext>, emit: bool);
     }
 }
 
@@ -1257,5 +1261,12 @@ impl<A: DeviceAllocator> ExecutionContext<A> {
 
     pub fn get_opt_profile(&self) -> i32 {
         self.ctx.get_optimization_profile()
+    }
+
+    pub fn set_enqueue_emits_profile(&mut self, emit: bool) {
+        self.ctx
+            .as_mut()
+            .expect("ffi: context should be non-null")
+            .set_enqueue_emits_profile(emit);
     }
 }
